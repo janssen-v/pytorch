@@ -6,6 +6,9 @@
 # aten/build/ will stop being cleaned.  So be careful when
 # refactoring this file!
 
+## Build
+torch_npu/dynamo/torchair/*
+
 ## PyTorch
 .coverage
 coverage.xml
@@ -202,3 +205,33 @@ torch_npu/csrc/aten/RegisterCPU.cpp
 torch_npu/csrc/aten/RegisterNPU.cpp
 torch_npu/csrc/aten/python_custom_functions.cpp
 torch_npu/_op_plugin_docs.py
+torch_npu/csrc/aten/ADInplaceOrViewType_0.cpp
+torch_npu/csrc/aten/ADInplaceOrViewType_1.cpp
+torch_npu/csrc/aten/ADInplaceOrViewTypeEverything.cpp
+torch_npu/csrc/aten/CustomFunctions.cpp
+torch_npu/csrc/aten/CustomFunctions.h
+torch_npu/csrc/aten/CustomRedispatch.cpp
+torch_npu/csrc/aten/CustomRedispatch.h
+torch_npu/csrc/aten/CustomRegisterSchema.cpp
+torch_npu/csrc/aten/ForeachRegister.cpp
+torch_npu/csrc/aten/Functions.cpp
+torch_npu/csrc/aten/Functions.h
+torch_npu/csrc/aten/npu_native_functions_by_codegen.yaml
+torch_npu/csrc/aten/NPUOpApiNativeFunctions.h
+torch_npu/csrc/aten/python_functions_0.cpp
+torch_npu/csrc/aten/python_functions_1.cpp
+torch_npu/csrc/aten/python_functions.h
+torch_npu/csrc/aten/python_functionsEverything.cpp
+torch_npu/csrc/aten/QuantizedRegister.cpp
+torch_npu/csrc/aten/RegisterFunctionalization_0.cpp
+torch_npu/csrc/aten/RegisterFunctionalization_1.cpp
+torch_npu/csrc/aten/RegisterFunctionalizationEverything.cpp
+torch_npu/csrc/aten/RegisterSparseCsrNPU.cpp
+torch_npu/csrc/aten/RegisterSparseNPU.cpp
+torch_npu/csrc/aten/variable_factories.h
+torch_npu/csrc/aten/VariableType_0.cpp
+torch_npu/csrc/aten/VariableType.h
+torch_npu/csrc/aten/VariableTypeEverything.cpp
+torch_npu/testing/_npu_testing_utils.py
+torch_npu/utils/custom_ops.py
+torch_npu/utils/exposed_api.py
