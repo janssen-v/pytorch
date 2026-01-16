@@ -195,7 +195,12 @@ def _patch_run_node(tracer, node, args, kwargs, nnmodule):
 def _register_npu_inductor_fallbacks_operation():
     from ..npu import inductor_patch
 
+def _register_npu_mixc2_fx_patterns():
+    """Register mixc2 NPU FX patterns for post_grad_passes"""
+    from ....fx_passes import mixc2   
+
 _register_npu_inductor_fallbacks_operation()
+_register_npu_mixc2_fx_patterns()
 disable_implicit_decomposition()
 torch._dynamo.utils.run_node = _patch_run_node
 
