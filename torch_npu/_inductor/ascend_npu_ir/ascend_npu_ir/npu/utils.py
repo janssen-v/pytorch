@@ -522,6 +522,7 @@ class MLIRProcessor:
             with open(torch_mlir_path, 'w') as f:
                 f.write(cleaned_func)
 
+            # TODO (Vincent): if self mixc2, else
             cmd = (f"{self.bisheng_torch_mlir_path} "
                     "--torch-backend-to-named-op-backend-pipeline="
                     "\"ensure-no-implicit-broadcast=true\" "
