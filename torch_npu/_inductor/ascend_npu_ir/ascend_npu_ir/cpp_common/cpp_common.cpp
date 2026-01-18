@@ -6,6 +6,15 @@
 #include <torch_npu/csrc/profiler/profiler_mgr.h>
 #include <dlfcn.h>
 #include <memory>
+#include "lcal_comm.h"
+
+#define ACL_CHECK(status)                                                                \
+{                                                                                        \
+    aclError error = status;                                                             \
+    if (error != ACL_ERROR_NONE) {                                                       \
+        std::cerr << __FILE__ << ":" << __LINE__ << " aclError:" << error << std::endl;  \
+    }                                                                                    \
+}
 
 extern "C" {
 #pragma pack(1)
@@ -216,4 +225,78 @@ void opcommand_call(const char *name, std::function<int()> launch_call)
     cmd.Name(name)
         .SetCustomHandler(launch_call)
         .Run();
+}
+
+static void prepare_tiling_for_c2(void* args, void* tiling_func, int64_t tilingSize,
+                           uint32_t gridX, rtStream_t stream, uint32_t argsSize, uint32_t rankSize)
+{
+    uint32_t args_num = argsSize / sizeof(void *);
+    void **args_cast = static_cast<void **>(args);
+
+    // 为tiling参数分配空间
+    void *args_tiling_host = nullptr;
+    ACL_CHECK(aclrtMallocHost((void **)&args_tiling_host, tilingSize));
+
+    // 为tiling func所需的args分配空间
+    void *args_for_tiling_func = nullptr;
+    uint32_t ArgsSizeForTilingFunc = argsSize - sizeof(void*);
+    uint32_t ArgsNumForTilingFunc = argsSize / sizeof(void*) - 1;
+    ACL_CHECK(aclrtMallocHost((void **)&args_for_tiling_func, ArgsSizeForTilingFunc));
+    ACL_CHECK(aclrtMemcpy(args_for_tiling_func, ArgsSizeForTilingFunc, 
+                            args_cast + 1, ArgsSizeForTilingFunc, ACL_MEMCPY_HOST_TO_HOST));
+
+    // 设置tiling func所需的args
+    void **args_for_tiling_func_cast = static_cast<void **>(args_for_tiling_func);
+    args_for_tiling_func_cast[ArgsNumForTilingFunc - 14] = (void*)rankSize; // ep size
+    args_for_tiling_func_cast[ArgsNumForTilingFunc - 13] = (void*)1; // tp size 目前只支持tp=1
+    args_for_tiling_func_cast[ArgsNumForTilingFunc - 10] = args_tiling_host;
+    args_for_tiling_func_cast[ArgsNumForTilingFunc - 9] = args_tiling_host;
+
+    // 执行tiling func获取tiling参数
+    using TilingFuncPtr = void (*)(void*);
+    TilingFuncPtr host_tiling_func = reinterpret_cast<TilingFuncPtr>(tiling_func);
+    host_tiling_func(args_for_tiling_func);
+
+    // 将host侧的tiling参数拷贝到device侧
+    uint8_t *cocTilingDevice;
+    ACL_CHECK(aclrtMalloc((void **)(&cocTilingDevice), tilingSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMemcpy(cocTilingDevice, tilingSize,
+                            args_tiling_host, tilingSize, ACL_MEMCPY_HOST_TO_DEVICE));
+
+    // 为kernel设置tiling参数
+    args_cast[args_num - 5] = cocTilingDevice;
+
+    ACL_CHECK(aclrtFreeHost(args_tiling_host));
+    ACL_CHECK(aclrtFreeHost(args_for_tiling_func));
+}
+
+extern "C" {
+uint32_t GetAscendCoreSyncAddr(void **addr);
+}
+
+rtError_t common_launch_ccl(char* kernelName, void* func, void* tiling_func, int64_t tilingSize, 
+                            void* commargsobject, uint32_t gridX, void* args, uint32_t argsSize, rtStream_t stream){
+    uint32_t args_num = argsSize / sizeof(void *);
+    void **args_cast = static_cast<void **>(args);
+    
+    // 为kernel设置入参
+    // ffts
+    uint8_t *fftsAddr{ nullptr };
+    GetAscendCoreSyncAddr(reinterpret_cast<void **>(&fftsAddr));
+    args_cast[0] = fftsAddr;
+    // commargs
+    Lcal::LcalComm* object = reinterpret_cast<Lcal::LcalComm *>(commargsobject);
+    auto commArgs = object->GetCommArgsPtr();
+    args_cast[args_num - 17] = commArgs;
+    // tiling args
+    if(tilingSize != 0) {
+        uint32_t rankSize = object->GetRankSize();
+        prepare_tiling_for_c2(args,tiling_func, tilingSize, gridX, stream, argsSize, rankSize);
+    }
+
+    // kernel launch
+    rtError_t ret = rtKernelLaunch(func, gridX, args, argsSize, NULL, stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+
+    return ret;
 }

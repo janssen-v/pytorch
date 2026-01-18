@@ -1,5 +1,7 @@
+import hashlib
 import os
-os.environ['TORCHINDUCTOR_MAX_AUTOTUNE'] = '1'
+
+os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "1"
 import sys
 import functools
 from typing import Callable, Dict, Any, Union, List, Tuple, Iterator
@@ -10,6 +12,8 @@ import subprocess
 import shutil
 
 import torch
+import torch_mlir
+from torch_mlir import ir
 import torch_npu
 from torch._inductor.compile_fx import clone_preserve_strides
 from torch._inductor.runtime.cache_dir_utils import triton_cache_dir
@@ -65,6 +69,7 @@ class NpuMlirCompiler:
         self.non_contiguous_outputs = None
         self.autotuned = False
         self.autotune = autotune
+        self.mixc2 = False # find a way to get mixc2 status
 
     def init(self, module, extra_env):
         os.environ.update(extra_env)
@@ -74,6 +79,7 @@ class NpuMlirCompiler:
                 self.kernel_meta.get("device_index", 0)
             )
         self.cache = get_cache_manager(self.kernel_hash)
+        self.process_mlir(module) # TODO (Vincent): Make sure this is actually needed or if it can be refactored
         self.prepare_launch(need_pickle=self.multiprocess_compile)
         self.get_named_op_path()
 
@@ -100,40 +106,104 @@ class NpuMlirCompiler:
         module_call = fx_graph_call(model, num_outputs)
         self.register_launcher(module_call, kernel_path=self.kernel_name + "_fx_fallback", is_fallback_kernel=True)
 
+    def extract_function(self, module: ir.Module):
+        with module.context:
+            for func in module.body.operations:
+                if isinstance(func, torch_mlir.dialects.func.FuncOp):
+                    func.attributes["hacc.placeholder"] = torch_mlir.ir.UnitAttr.get(func.context)
+                    return func
+
+    def get_signature(self, func):
+        func_type = func.type
+        signature = dict()
+        inputs_outputs = func_type.inputs + func_type.results
+        ranks = []
+        for i, tensor_type in enumerate(inputs_outputs):
+            try: # For RankedTensorType
+                signature[i] = '*' + str(tensor_type.element_type)
+            except AttributeError: # For ValueTensorType
+                signature[i] = '*' + str(tensor_type).split(',')[-1].split('>')[0]
+            ranks.append(str(tensor_type).split('],')[0].split('[')[-1].count(',') + 1)
+        num_outputs = len(func_type.results)
+        return signature, num_outputs, ranks
+
+    def rebuild_mlir_module(self, module: str):
+        with ir.Context() as ctx:
+            ctx.allow_unregistered_dialects = True
+            torch_mlir.dialects.torch.register_dialect(ctx)
+            module = ir.Module.parse(module)
+            return module
+
+    def choose_meta_ops(self, directory: str, keyword: str):
+        src_aic = os.path.join(directory, f"meta_op{keyword}.aic.bc")
+        src_aiv = os.path.join(directory, f"meta_op{keyword}.aiv.bc")
+        src_host_func = os.path.join(directory, f"host_tiling_func{keyword}.bc")
+
+        dst_aic = os.path.join(directory, "meta_op.aic.bc")
+        dst_aiv = os.path.join(directory, "meta_op.aiv.bc")
+        dst_host_func = os.path.join(directory, "host_tiling_func.bc")
+
+        if os.path.exists(src_aic):
+            shutil.copyfile(src_aic, dst_aic)
+            logger.info(f"Copied {src_aic} -> {dst_aic}")
+        else:
+            logger.info(f"src_aic not exist: {src_aic}")
+
+        if os.path.exists(src_aiv):
+            shutil.copyfile(src_aiv, dst_aiv)
+            logger.info(f"Copied {src_aiv} -> {dst_aiv}")
+        else:
+            logger.info(f"src_aiv not exist: {src_aiv}")
+
+        if os.path.exists(src_host_func):
+            shutil.copyfile(src_host_func, dst_host_func)
+            logger.info(f"Copied {src_host_func} -> {dst_host_func}")
+        else:
+            logger.info(f"src_host_func_bc not exist: {src_host_func}")
+
     def bisheng_compile(self,
                         input_path: str,
                         output_path: str,
                         auto_db=True,
                         ops_reorder=False,
                         tiling_size=None,
-                        extra_command=None):
-        bisheng_install_path = os.getenv('BISHENG_INSTALL_PATH', '')
+                        extra_command=None,
+                        mixc2=False):
+        bisheng_install_path = os.getenv('BISHENG_INSTALL_PATH', '') # bisheng-hivm-compile must be in PATH
         bisheng_ir_compile_path = os.path.join(bisheng_install_path, "bishengir-compile")
         command = [
             bisheng_ir_compile_path,
+            "-enable-lir-compile=true",
+            "-enable-hivm-compile=true",
             "-enable-hfusion-compile=true",
             "--enable-bin-relocation=0",
             f"-block-dim={anir_config.block_dim}",
         ]
-        if auto_db:
-            command.append("--enable-auto-multi-buffer=true")
-        else:
-            command.append("--enable-auto-multi-buffer=false")
-
-        if ops_reorder:
-            command.append("--enable-ops-reorder=true")
-        else:
-            command.append("--enable-ops-reorder=false")
-
-        if tiling_size is not None:
-            command.append(f"--hfusion-max-buffer-count-tuning={tiling_size}")
-
-        if anir_config.autotune:
-            command.append("-enable-tuning-mode=true")
-
-        if self.dynamic:
+        if mixc2:
+            command.append("--enable-mix-c2-compile=true")
             command.append("--enable-static-bare-ptr=false")
-            command.append("--enable-symbol-analysis=true")
+            command.append("--allow-unregistered-dialects")
+            command.append("--enable-ops-reorder=false")
+        else:
+            if auto_db:
+                command.append("--enable-auto-multi-buffer=true")
+            else:
+                command.append("--enable-auto-multi-buffer=false")
+
+            if ops_reorder:
+                command.append("--enable-ops-reorder=true")
+            else:
+                command.append("--enable-ops-reorder=false")
+
+            if tiling_size is not None:
+                command.append(f"--hfusion-max-buffer-count-tuning={tiling_size}")
+
+            if anir_config.autotune:
+                command.append("-enable-tuning-mode=true")
+
+            if self.dynamic:
+                command.append("--enable-static-bare-ptr=false")
+                command.append("--enable-symbol-analysis=true")
 
         if isinstance(extra_command, list) and extra_command:
             command += extra_command
@@ -142,6 +212,13 @@ class NpuMlirCompiler:
             "-o", output_path
         ]
         logger.info(f"Start to compile, command is: [{' '.join(command)}]")
+
+        # Choose meta-op implementation for fused op
+        if mixc2:
+            pattern_type = self.kernel_name.split("MIXC2", 1)[1]
+            self.choose_meta_ops(bisheng_install_path, pattern_type)
+
+        logger.info(f"Start to compile, command is: [{' '.join(command)}]")
         try:
             subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
             logger.info(f"[bisheng-compile success]")
@@ -149,7 +226,22 @@ class NpuMlirCompiler:
             logger.info(f"[bisheng-compile failed]")
             logger.warning(f"Compile error msg: {e.stderr.decode('utf-8')}")
             raise e
-        
+
+    def process_mlir(self, module: Union[str, torch_mlir.ir.Module]):
+        if isinstance(module, str):
+            module = self.rebuild_mlir_module(module)
+        func = self.extract_function(module)
+        self.signature, self.num_outputs, self.ranks = self.get_signature(func)
+        self.func_str = str(func)
+        self.func_name = func.name.value
+        self.mixc2 = "MIXC2" in self.func_name
+        func_hash_str = self.func_str + "_host" if self.dynamic else self.func_str
+        self.hash = hashlib.sha256(func_hash_str.encode("utf-8")).hexdigest()
+        logger.info(f"Hash code {self.hash}")
+        self.cache = get_cache_manager(self.hash)
+        logger.info("after get_cache_manager")
+        self.kernel_name = self.kernel_name if self.kernel_name else f"{self.func_name}"
+
     def prepare_launch(self, need_pickle=False):
         def get_launch_mod(so_path):
             spec = importlib.util.spec_from_file_location("__launcher", so_path)
@@ -181,17 +273,83 @@ class NpuMlirCompiler:
                 self.get_host_func_and_tiling_size = getattr(mod, "get_host_func_and_tiling_size")
 
     def get_named_op_path(self):
-        named_op_name = f"{self.kernel_name}_named_op.mlir"
-        cache_mlir_path = self.cache.get_file(named_op_name)
-        if cache_mlir_path is None or (anir_config.always_compile and cache_mlir_path not in global_cache):
-            #if anir_config.cache_named_op:
-            cache_mlir_path = self.cache.put(self.mlir_text, named_op_name)
-            global_cache.add(cache_mlir_path)
-        if anir_config.fx_subgraph_dump_path:
-            shutil.copy(cache_mlir_path, os.path.join(anir_config.fx_subgraph_dump_path, \
-                                                      str(self.device_index), self.kernel_name))
+        if self.mixc2:
+            hfusion_mlir_name = f"{self.func_name}_hfusion.mlir"
+            cache_hfusion_mlir_path = self.cache.get_file(hfusion_mlir_name)
+            bisheng_torch_mlir_path = (
+                f"{os.environ.get('BISHENG_INSTALL_PATH')}/bishengir-opt"
+            )
+            if cache_hfusion_mlir_path is None or (
+                anir_config.always_compile
+                and cache_hfusion_mlir_path not in global_cache
+            ):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    torch_mlir_path = os.path.join(
+                        tmpdir, f"{self.func_name}.mlir"
+                    )
+                    with open(torch_mlir_path, "w") as f:
+                        f.write(self.mlir_text)
+
+                    pass_pipeline = (
+                        "builtin.module("
+                        "torch-func-backend-type-conversion,"
+                        "func.func("
+                        "torch-scalarize-shapes,"
+                        "convert-torch-to-linalg,"
+                        "convert-torch-to-hfusion,"
+                        "convert-torch-to-tmtensor,"
+                        "convert-torch-to-mesh,"
+                        "convert-torch-to-hfusion,"
+                        "convert-torch-to-arith,"
+                        "convert-torch-to-tensor,"
+                        "convert-torch-to-linalg,"
+                        "canonicalize,"
+                        "cse,"
+                        "torch-finalizing-backend-type-conversion"
+                        "))"
+                    )
+
+                    output = subprocess.check_output(
+                        [
+                            bisheng_torch_mlir_path,
+                            f"--pass-pipeline={pass_pipeline}",
+                            torch_mlir_path,
+                        ],
+                        text=True,
+                    )
+
+                    output = output.replace(
+                        "hacc.placeholder",
+                        "hacc.entry, hacc.function_kind = #hacc.function_kind<DEVICE>",
+                    )
+
+                    cache_hfusion_mlir_path = self.cache.put(
+                        self.mlir_text, hfusion_mlir_name
+                    )
+                    global_cache.add(cache_hfusion_mlir_path)
+
+            return cache_hfusion_mlir_path
+
+        else:
+            named_op_name = f"{self.kernel_name}_named_op.mlir"
+            cache_mlir_path = self.cache.get_file(named_op_name)
+            if cache_mlir_path is None or (
+                anir_config.always_compile and cache_mlir_path not in global_cache
+            ):
+                # Why is there nothing below here? NPU-Inductor/AKG still doesn't seem to be integrated.
+                cache_mlir_path = self.cache.put(self.mlir_text, named_op_name)
+                global_cache.add(cache_mlir_path)
+            if anir_config.fx_subgraph_dump_path:
+                shutil.copy(
+                    cache_mlir_path,
+                    os.path.join(
+                        anir_config.fx_subgraph_dump_path,
+                        str(self.device_index),
+                        self.kernel_name,
+                    ),
+                )
         return cache_mlir_path
-    
+
     def get_launch_dynamic(self, function, tiling_func, tiling_size):
         block_dim = anir_config.block_dim
         arg_tiling_device = torch.empty((tiling_size // 8), device='npu', dtype=torch.int64)
@@ -199,25 +357,53 @@ class NpuMlirCompiler:
         def kernel_call(*args, stream=None):
             self.launch(block_dim, stream, function, tiling_func, tiling_size, arg_tiling_host, arg_tiling_device, None, None, None, *args)
         return kernel_call
-    
+
     def get_launch(self, function):
         block_dim = anir_config.block_dim
         def kernel_call(*args, function, stream=None):
             self.launch(block_dim, stream, function, None, None, None, *args)
 
         return functools.partial(kernel_call, function=function)
-    
+
     def get_launch_func(self, cache_kernel_path):
         if self.dynamic:
-            function, tiling_func, tiling_size = self.get_host_func_and_tiling_size(self.kernel_name, 
-                                                                                    self.kernel_name + '_tiling_function', 
-                                                                                    self.kernel_name + '_get_tiling_struct_size_function', 
-                                                                                    cache_kernel_path)
+            if self.mixc2:
+                dir_ = os.path.dirname(cache_kernel_path)
+                stem = os.path.splitext(os.path.basename(cache_kernel_path))[0]
+                name = "lib" + stem + ".so"
+                cache_kernel_so_path = os.path.join(dir_, name)
+                tiling_func, tiling_size = self.get_host_func_and_tiling_size(self.func_name,
+                                                                            self.func_name + '_tiling_function',
+                                                                            self.func_name + '_get_tiling_struct_size_function',
+                                                                            cache_kernel_so_path)
+                function = load_kernel_binary(self.func_name, cache_kernel_path)
+                return self.get_launch_func_hccl(function, tiling_func, tiling_size)
+            else:
+                function, tiling_func, tiling_size = self.get_host_func_and_tiling_size(self.kernel_name, 
+                                                                                        self.kernel_name + '_tiling_function', 
+                                                                                        self.kernel_name + '_get_tiling_struct_size_function', 
+                                                                                        cache_kernel_path)
             return self.get_launch_dynamic(function, tiling_func, tiling_size)
         else:
             function = load_kernel_binary(self.kernel_name, cache_kernel_path)
             return self.get_launch(function)
     
+    def get_launch_func_hccl(self, function, tiling_func, tiling_size):
+        block_dim = anir_config.block_dim
+        def kernel_call(*args, stream=None):
+            logger.info("Start to launch hccl kernel")
+            logger.info(f"kernel call arg num: {len(args)}")
+            device_index = [args[0].device]
+            process_group_lccl = None
+            for pg, pg_info in torch.distributed.distributed_c10d._pg_map.items():
+                if pg_info[0] == "lccl":
+                    process_group_lccl = pg._get_backend(torch.device('npu'))
+            commargs = process_group_lccl.get_lccl_comm_args(str(args[0].device), device_index)
+            logger.info(f"commargs : {hex(commargs)}")
+            self.launch(block_dim, stream, function, tiling_func, tiling_size, commargs, None, None, None, *args)
+        return kernel_call
+        
+
     def register_launcher(self, 
                           launcher, 
                           kernel_path=None, 
@@ -254,14 +440,14 @@ class NpuMlirCompiler:
         tiling_size, ops_reorder, auto_db = compile_args
         tiling_str = f"_{tiling_size}_{ops_reorder}_{auto_db}"
         tiling_kernel_name = kernel_name + tiling_str
-        if self.dynamic:
+        if self.dynamic and not self.mixc2:
             cache_kernel_path = self.cache.get_file(f"lib{tiling_kernel_name}.so")
         else:
             cache_kernel_path = self.cache.get_file(f"{tiling_kernel_name}.o")
 
         logger.info("Start to get cached kernel. Tiling info: " +
                     f"tiling_size {tiling_size} ops_reorder {ops_reorder} auto_db {auto_db}")
-        
+
         if cache_kernel_path is None and self.no_more_compile:
             raise RuntimeError("Skip compile.")
 
@@ -271,10 +457,9 @@ class NpuMlirCompiler:
                 kernel_path = os.path.join(tmpdir, tiling_kernel_name)
                 self.bisheng_compile(named_op_mlir_path, kernel_path, tiling_size=tiling_size,
                                     ops_reorder=ops_reorder, auto_db=auto_db,
-                                    extra_command=anir_config.extra_command)
-                
-                
-                if self.dynamic:
+                                    extra_command=anir_config.extra_command, mixc2=self.mixc2)
+
+                if self.dynamic or self.mixc2:
                     kernel_path = os.path.join(tmpdir, f"lib{tiling_kernel_name}.so")
                     with open(kernel_path, "rb") as f:
                         cache_kernel_path =  self.cache.put(f.read(), f"lib{tiling_kernel_name}.so", binary=True)
@@ -327,7 +512,7 @@ class NpuMlirCompiler:
         self.launch = getattr(mod, "launch")
         if self.dynamic:
             self.get_host_func_and_tiling_size = getattr(mod, "get_host_func_and_tiling_size")
-        
+
         launch_func = self.get_launch_func(kernel_path)
         self.register_launcher(launch_func, kernel_path)
         return True
@@ -350,7 +535,7 @@ class NpuMlirCompiler:
         if anir_config.autotune:
             compile_args = self.get_autotune_config()
         else:
-            compile_args = [(None, True, True)]
+            compile_args = [(None, False, False)] if self.mixc2 else [(None, True, True)]
         for cargs in compile_args:
             try:
                 self.compile_mlir(device_info, cargs, logger_level=logger_level)
@@ -434,7 +619,7 @@ class NpuMlirCompiler:
                 print(e)
                 continue
         return timings
-    
+
     def autotune_to_one_config(self, *args, **kwargs):
         if anir_config.autotune_fx_fallback:
             self.register_fx_fallback(self.kernel_meta)
@@ -481,7 +666,7 @@ class NpuMlirCompiler:
             shutil.rmtree(failed_subgraph_dump_path)
         shutil.copytree(subgraph_dump_path, failed_subgraph_dump_path)
         return failed_subgraph_dump_path
-        
+
     def acc_compare_and_dump(self, *args, **kwargs):
         from torch.testing._comparison import _make_mismatch_msg
         self.register_fx_fallback(self.kernel_meta)
@@ -492,7 +677,7 @@ class NpuMlirCompiler:
                       else clone_preserve_strides(arg) for arg in args[-self.num_outputs:]]
         fx_inputs = [clone_preserve_strides(arg) if isinstance(arg, torch.Tensor) else arg for arg in args[:-self.num_outputs]]
         fx_inputs = [inp.float() if isinstance(inp, torch.Tensor) and inp.dtype == torch.bfloat16 else inp for inp in fx_inputs]
-        
+
         fx_args = fx_inputs + fx_outputs
         launcher_fx(*fx_args, **kwargs)
 
@@ -505,7 +690,7 @@ class NpuMlirCompiler:
                 args_new = args_new + (arg, arg, 0) + arg.size() + arg.stride()
         else:
             args_new = args
-        
+
         output = launcher(*args_new, **kwargs)
 
         has_acc_error = False
@@ -547,7 +732,7 @@ class NpuMlirCompiler:
                 del rel_diff
             del matches
             del expected
-        
+
         if anir_config.fx_subgraph_dump_path:
             data = args
             if has_acc_error:
@@ -557,9 +742,9 @@ class NpuMlirCompiler:
         torch.npu.synchronize()
         self.launchers = [self.launchers[0]]
         self.is_fallback_kernels = [self.is_fallback_kernels[0]]
-        
+
         return output
-    
+
     def mlir_dump(self, *args, **kwargs):
         self.data_dump(*args)
         launcher_fx = self.launchers[-1]
@@ -571,10 +756,10 @@ class NpuMlirCompiler:
         for idx in self.non_contiguous_indices['inputs']:
             args[idx] = args[idx].contiguous()
         return tuple(args)
-        
+
     def run(self, *args, **kwargs):
         args = list(args)
-        
+
         if self.non_contiguous_inputs is None:
             self.non_contiguous_inputs = []
             if self.num_call_functions > 0:
@@ -587,7 +772,7 @@ class NpuMlirCompiler:
                 args[idx] = args[idx].contiguous()
 
         contiguous_outputs = []
-        
+
         if self.non_contiguous_outputs is None:
             self.non_contiguous_outputs = []
             original_outputs = []
@@ -613,7 +798,7 @@ class NpuMlirCompiler:
                 original_outputs.append(args[idx])
                 args[idx] = contiguous_output
                 contiguous_outputs.append(contiguous_output)
-    
+
         if not self.autotuned:
             if len(self.launchers) > 1:
                 self.autotune_to_one_config(*args, **kwargs)

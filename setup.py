@@ -31,6 +31,7 @@ os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 from codegen.utils import PathManager
 
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+EDITABLE = os.environ.get("TORCH_NPU_EDITABLE", "0").lower() in ["1", "true", "yes", "on"]
 THIRD_PARTY_PATH = os.path.join(BASE_DIR, "third_party")
 PathManager.check_directory_path_readable(os.path.join(BASE_DIR, "version.txt"))
 with open(os.path.join(BASE_DIR, "version.txt")) as version_f:
@@ -56,6 +57,19 @@ USE_CXX11_ABI = True
 if os.environ.get("_GLIBCXX_USE_CXX11_ABI") is not None and os.environ.get("_GLIBCXX_USE_CXX11_ABI") == "0":
     USE_CXX11_ABI = False
 
+def ensure_editable_lib_link():
+    """
+    In editable mode, expose the built libs next to the extension by
+    linking torch_npu/lib -> build/packages/torch_npu/lib.
+    """
+    if not EDITABLE:
+        return
+    src = Path(BASE_DIR) / "build/packages/torch_npu/lib"
+    dst = Path(BASE_DIR) / "torch_npu/lib"
+    if dst.exists() or dst.is_symlink():
+        return
+    if src.exists():
+        dst.symlink_to(src, target_is_directory=True)
 
 def get_submodule_folders():
     git_modules_path = os.path.join(BASE_DIR, ".gitmodules")
@@ -379,15 +393,18 @@ class CPPLibBuild(build_clib, object):
 
 
 class Build(build_ext, object):
-
+# Make the extension build in-place and make libs reachable when editable
     def run(self):
         self.run_command('build_clib')
+        # In editable mode, build the extension into the source tree
+        if EDITABLE:
+            self.inplace = True
         self.build_lib = os.path.relpath(os.path.join(BASE_DIR, "build/packages"))
         self.build_temp = os.path.relpath(os.path.join(BASE_DIR, "build"))
         self.library_dirs.append(
             os.path.relpath(os.path.join(BASE_DIR, "build/packages/torch_npu/lib")))
         super(Build, self).run()
-
+        ensure_editable_lib_link()
 
 class InstallCmd(install):
 
@@ -526,10 +543,12 @@ def get_src_py_and_dst():
 
 class EggInfoBuild(egg_info, object):
     def finalize_options(self):
-        self.egg_base = os.path.relpath(os.path.join(BASE_DIR, "build/packages"))
         ret = get_src_py_and_dst()
         for src, dst in ret:
             self.copy_file(src, dst)
+        if EDITABLE:
+            return super(EggInfoBuild, self).finalize_options()
+        self.egg_base = os.path.relpath(os.path.join(BASE_DIR, "build/packages"))d
         super(EggInfoBuild, self).finalize_options()
 
 
@@ -538,6 +557,8 @@ class PythonPackageBuild(build_py, object):
         ret = get_src_py_and_dst()
         for src, dst in ret:
             self.copy_file(src, dst)
+        if EDITABLE:
+            return super(PythonPackageBuild, self).run()
         super(PythonPackageBuild, self).finalize_options()
 
 
@@ -674,7 +695,7 @@ setup(
     classifiers=classifiers,
     packages=["torch_npu"],
     libraries=[('torch_npu', {'sources': list()})],
-    package_dir={'': os.path.relpath(os.path.join(BASE_DIR, "build/packages"))},
+    package_dir={'': ''} if EDITABLE else {'': os.path.relpath(os.path.join(BASE_DIR, "build/packages"))},
     ext_modules=[
             CppExtension(
                 'torch_npu._C',

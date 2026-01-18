@@ -1,4 +1,4 @@
-def cpp_launcher(signature, kernel_name, ranks, dynamic=False) -> str:
+def cpp_launcher(signature, kernel_name, ranks, dynamic=False, c2_fusion=False) -> str:
     def _ty_to_cpp(ty):
         if ty[0] == '*':
             return "void*"
@@ -46,6 +46,193 @@ def cpp_launcher(signature, kernel_name, ranks, dynamic=False) -> str:
             "uint64_t": "K",
             "int64_t": "L",
         }[ty]
+    if c2_fusion:
+        arg_decls = ', '.join(
+            f"{_ty_to_cpp(ty)} arg{i}, {_ty_to_cpp(ty)} allocate{i}, {_ty_to_cpp(ty)} offset{i}, "
+            + ', '.join(f"{_ty_to_cpp(ty)} sizes{i}_{rank}" for rank in range(ranks[i])) + ', '
+            + ', '.join(f"{_ty_to_cpp(ty)} strides{i}_{rank}" for rank in range(ranks[i]))
+            for i, ty in signature.items()
+        )
+        format = "iKKKLLOOO" + ''.join([_format_of(_extracted_ty(ty))*2 + 'L' + 'L'*ranks[i]*2 for i, ty in signature.items()])
+        return f"""
+#include <cpp_common.h>
+#include <stdbool.h>
+#include <string>
+#include <dlfcn.h>
+#include <iostream>
+
+typedef struct _DevicePtrInfo {{
+  void *dev_ptr;
+  bool valid;
+}} DevicePtrInfo;
+
+static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
+  DevicePtrInfo ptr_info;
+  ptr_info.dev_ptr = 0;
+  ptr_info.valid = true;
+  if (PyLong_Check(obj)) {{
+    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));
+    return ptr_info;
+  }}
+  if (obj == Py_None) {{
+    // valid nullptr
+    return ptr_info;
+  }}
+  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
+  if(ptr){{
+    PyObject *empty_tuple = PyTuple_New(0);
+    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
+    Py_DECREF(empty_tuple);
+    Py_DECREF(ptr);
+    if (!PyLong_Check(ret)) {{
+      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
+      ptr_info.valid = false;
+      return ptr_info;
+    }}
+    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
+    if(!ptr_info.dev_ptr)
+      return ptr_info;
+    Py_DECREF(ret);
+    return ptr_info;
+  }}
+  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
+  return ptr_info;
+}}
+
+static PyObject* get_host_func_and_tiling_size(PyObject* self, PyObject* args) {{
+  const char *func_name;
+  const char *tiling_func_name;
+  const char *get_tiling_struct_size_func_name;
+  const char *so_file;
+  if(!PyArg_ParseTuple(
+    args, "ssss", &func_name, &tiling_func_name, &get_tiling_struct_size_func_name, &so_file
+    )
+  ) {{
+    return NULL;
+  }}
+  void *handle = dlopen(so_file, RTLD_LAZY);
+  if (handle == NULL) {{
+      std::cout<<"handle == NULL! "<<so_file<<std::endl;
+      return Py_None;
+  }}
+  int64_t tilingSize = 112; // 14 * i64
+
+  typedef int64_t (*mlir_tiling_func)(void*);
+  mlir_tiling_func tiling_func = NULL;
+  if (tilingSize != 0) {{
+    tiling_func = (mlir_tiling_func)dlsym(handle, tiling_func_name);
+    if (tiling_func == NULL) {{
+      std::cout<<"Failed to load symbol for tiling_func: "<<dlerror()<<std::endl;
+      dlclose(handle);
+      return Py_None;
+    }}
+  }}
+
+  return PyTuple_Pack(2, PyLong_FromUnsignedLong(reinterpret_cast<uintptr_t>(tiling_func)), PyLong_FromLongLong(tilingSize));
+}}
+
+static void _launch2(void* func, void* tiling_func, int64_t tiling_size, void* commargs, rtStream_t stream, int gridX, {arg_decls}) {{
+  // only 1D parallelization is supported for NPU
+  // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
+  // base_ptr offset shape and stride are not used, arbitrarily set for now
+
+  auto launch_call = [func, tiling_func, tiling_size, commargs, gridX, stream, {', '.join(f"arg{i}, allocate{i}, offset{i}, " + ', '.join(f"sizes{i}_{rank}" for rank in range(ranks[i])) + ', ' + ', '.join(f"strides{i}_{rank}" for rank in range(ranks[i])) for i, ty in signature.items())}]() {{
+    struct __attribute__((packed)) {{
+    void* ffts_addr;
+    {' '.join(f'{_ty_to_cpp(ty)} arg{i}; {_ty_to_cpp(ty)} allocate{i}; {_ty_to_cpp(ty)} offset{i}; ' + ' '.join(f'{_ty_to_cpp(ty)} sizes{i}_{rank} ;' for rank in range(ranks[i])) + ' ' + ' '.join(f'{_ty_to_cpp(ty)} strides{i}_{rank};' for rank in range(ranks[i])) for i, ty in signature.items())}
+    void* arg_comm;
+    void* allocate_comm;
+    void* offset_comm;
+    void* sizes_comm_0;
+    void* sizes_comm_1;
+    void* strides_comm_0;
+    void* strides_comm_1;
+    void* arg_workspace;
+    void* arg_allocate_workspace;
+    void* offset_workspace;
+    void* sizes_workspace;
+    void* strides_workspace;
+    void* arg_tiling;
+    void* arg_allocate_tiling;
+    void* offset_tiling;
+    void* sizes_tiling;
+    void* strides_tiling;
+    }} 
+    args = {{
+    nullptr,
+    {', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i}), static_cast<{_ty_to_cpp(ty)}>(allocate{i}), static_cast<{_ty_to_cpp(ty)}>(offset{i}), " + ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(sizes{i}_{rank})" for rank in range(ranks[i])) + ', ' + ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(strides{i}_{rank})" for rank in range(ranks[i])) for i, ty in signature.items())},
+    commargs, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, 
+    nullptr, nullptr, nullptr, nullptr, nullptr
+    }};
+    rtError_t ret = common_launch_ccl(const_cast<char*>("{kernel_name}"), func, tiling_func, tiling_size, commargs, gridX, static_cast<void *>(&args), sizeof(args), stream);
+    return ret;
+  }};
+  opcommand_call("{kernel_name}", launch_call);
+}}
+
+static PyObject* launch(PyObject* self, PyObject* args) {{
+  int gridX;
+  rtStream_t stream;
+  PyObject *func;
+  PyObject *tiling_func;
+  int64_t tiling_size;
+  int64_t commargs;
+  PyObject *launch_enter_hook = NULL;
+  PyObject *launch_exit_hook = NULL;
+  PyObject *metadata = NULL;
+
+  {'; '.join(f"{_extracted_ty(ty)} _arg{i}; {_extracted_ty(ty)} _allocate{i}; int64_t offset{i}; " + '; '.join(f"int64_t sizes{i}_{rank}" for rank in range(ranks[i])) + '; ' + '; '.join(f"int64_t strides{i}_{rank}" for rank in range(ranks[i])) for i, ty in signature.items()) + '; '}
+  if(!PyArg_ParseTuple(
+      args, \"{format}\",
+      &gridX, &stream, &func, &tiling_func, &tiling_size, &commargs,
+      &launch_enter_hook, &launch_exit_hook, &metadata
+      {', ' + ', '.join(f"&_arg{i}, &_allocate{i}, &offset{i}" + ', ' + ', '.join(f"&sizes{i}_{rank}" for rank in range(ranks[i])) + ', ' + ', '.join(f"&strides{i}_{rank}" for rank in range(ranks[i])) for i, ty in signature.items()) if len(signature) > 0 else ''}
+      )
+    ) {{
+    return NULL;
+  }}
+  // raise exception asap
+  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL" if ty[0] == "*" else "" for i, ty in signature.items()])};
+  {"; ".join([f"DevicePtrInfo ptr_allocate_info{i} = getPointer(_allocate{i}, {i}); if (!ptr_allocate_info{i}.valid) return NULL" if ty[0] == "*" else "" for i, ty in signature.items()])};
+
+  _launch2(reinterpret_cast<void *>(func), reinterpret_cast<void *>(tiling_func), tiling_size, reinterpret_cast<void *>(commargs), stream, gridX, {', '.join(f"ptr_info{i}.dev_ptr, ptr_allocate_info{i}.dev_ptr, reinterpret_cast<void *>(offset{i})" + ', ' + ', '.join(f"reinterpret_cast<void *>(sizes{i}_{rank})" for rank in range(ranks[i])) + ', ' + ', '.join(f"reinterpret_cast<void *>(strides{i}_{rank})" for rank in range(ranks[i])) for i, ty in signature.items())});
+
+  if (PyErr_Occurred()) {{
+    return NULL;
+  }}
+  if (launch_exit_hook != Py_None && !PyObject_CallObject(launch_exit_hook, args)) {{
+    return NULL;
+  }}
+
+  // return None
+  Py_INCREF(Py_None);
+  return Py_None;
+}}
+
+static PyMethodDef ModuleMethods[] = {{
+  {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
+  {{"get_host_func_and_tiling_size", get_host_func_and_tiling_size, METH_VARARGS, "Get host func from kernel.so"}},
+  {{NULL, NULL, 0, NULL}} // sentinel
+}};
+
+static struct PyModuleDef ModuleDef = {{
+  PyModuleDef_HEAD_INIT,
+  "__launcher",
+  NULL, //documentation
+  -1, //size
+  ModuleMethods
+}};
+
+PyMODINIT_FUNC PyInit___launcher(void) {{
+  PyObject *m = PyModule_Create(&ModuleDef);
+  if(m == NULL) {{
+    return NULL;
+  }}
+  PyModule_AddFunctions(m, ModuleMethods);
+  return m;
+}}
+"""
     if dynamic:
         arg_decls = ', '.join(
             f"{_ty_to_cpp(ty)} arg{i}"
